@@ -118,7 +118,8 @@ class SuperPoint(Extractor):
 
     required_data_keys = ["image"]
 
-    def __init__(self, **conf):
+    def __init__(self, resize: int = 1024, **conf):
+        self.preprocess_conf["resize"] = resize
         super().__init__(**conf)  # Update with default configuration.
         self.relu = nn.ReLU(inplace=True)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)

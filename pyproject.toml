@@ -14,7 +14,7 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
 ]
-urls = {Repository = "https://github.com/cvg/LightGlue/"}
+urls = {Repository = "https://github.com/carbonrobotics/LightGlue/"}
 dynamic = ["dependencies"]
 
 [project.optional-dependencies]

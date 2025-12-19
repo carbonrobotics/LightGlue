@@ -42,11 +42,12 @@
 
 # Adapted by Remi Pautrat, Philipp Lindenberger
 
+from typing import Optional, Tuple
 import torch
 from kornia.color import rgb_to_grayscale
 from torch import nn
 
-from .utils import Extractor
+from .utils import Extractor, ImagePreprocessor
 
 
 def simple_nms(scores, nms_radius: int):
@@ -226,3 +227,133 @@ class SuperPoint(Extractor):
             "keypoint_scores": torch.stack(scores, 0),
             "descriptors": torch.stack(descriptors, 0).transpose(-1, -2).contiguous(),
         }
+
+
+def preprocess(image: torch.Tensor, resize_long_dimension: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    image, scale = ImagePreprocessor(resize=resize_long_dimension)(image)
+    return image, scale
+
+
+def postprocess(
+    scores: torch.Tensor,
+    descriptors: torch.Tensor,
+    scale: torch.Tensor,
+    nms_radius: int = 4,
+    remove_borders: int = 4,
+    detection_threshold: float = 0.0005,
+    max_num_keypoints: Optional[int] = None,
+    batch_size: int = 1,
+) -> dict:
+    scores = simple_nms(scores, nms_radius)
+
+    # Discard keypoints near the image borders
+    if remove_borders:
+        pad = remove_borders
+        scores[:, :pad] = -1
+        scores[:, :, :pad] = -1
+        scores[:, -pad:] = -1
+        scores[:, :, -pad:] = -1
+
+    # Extract keypoints
+    best_kp = torch.where(scores > detection_threshold)
+    scores = scores[best_kp]
+
+    # Separate into batches
+    keypoints = [
+        torch.stack(best_kp[1:3], dim=-1)[best_kp[0] == i] for i in range(batch_size)
+    ]
+    scores = [scores[best_kp[0] == i] for i in range(batch_size)]
+
+    # Keep the k keypoints with highest score
+    if max_num_keypoints is not None:
+        keypoints, scores = list(
+            zip(
+                *[
+                    top_k_keypoints(k, s, max_num_keypoints)
+                    for k, s in zip(keypoints, scores)
+                ]
+            )
+        )
+
+    keypoints = [torch.flip(k, [1]).float() for k in keypoints]
+
+    descriptors = [
+        sample_descriptors(k[None], d[None], 8)[0]
+        for k, d in zip(keypoints, descriptors)
+    ]
+    
+    keypoints = torch.stack(keypoints, 0)
+    keypoints = (keypoints + 0.5) / scale.unsqueeze(0) - 0.5
+    
+    return {
+        "keypoints": keypoints,
+        "keypoint_scores": torch.stack(scores, 0),
+        "descriptors": torch.stack(descriptors, 0).transpose(-1, -2).contiguous(),
+    }
+
+
+class SuperPointLite(torch.nn.Module):
+    """
+    Just the network, no post processing
+    """
+    def __init__(self, descriptor_dim: int = 256):
+        super().__init__()  # Update with default configuration.
+        self.relu = nn.ReLU(inplace=True)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        c1, c2, c3, c4, c5 = 64, 64, 128, 128, 256
+
+        self.conv1a = nn.Conv2d(1, c1, kernel_size=3, stride=1, padding=1)
+        self.conv1b = nn.Conv2d(c1, c1, kernel_size=3, stride=1, padding=1)
+        self.conv2a = nn.Conv2d(c1, c2, kernel_size=3, stride=1, padding=1)
+        self.conv2b = nn.Conv2d(c2, c2, kernel_size=3, stride=1, padding=1)
+        self.conv3a = nn.Conv2d(c2, c3, kernel_size=3, stride=1, padding=1)
+        self.conv3b = nn.Conv2d(c3, c3, kernel_size=3, stride=1, padding=1)
+        self.conv4a = nn.Conv2d(c3, c4, kernel_size=3, stride=1, padding=1)
+        self.conv4b = nn.Conv2d(c4, c4, kernel_size=3, stride=1, padding=1)
+
+        self.convPa = nn.Conv2d(c4, c5, kernel_size=3, stride=1, padding=1)
+        self.convPb = nn.Conv2d(c5, 65, kernel_size=1, stride=1, padding=0)
+
+        self.convDa = nn.Conv2d(c4, c5, kernel_size=3, stride=1, padding=1)
+        self.convDb = nn.Conv2d(
+            c5, descriptor_dim, kernel_size=1, stride=1, padding=0
+        )
+
+        url = "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/superpoint_v1.pth"  # noqa
+        self.load_state_dict(torch.hub.load_state_dict_from_url(url))
+
+    def forward(self, image: torch.Tensor) -> dict:
+        """Compute keypoints, scores, descriptors for image"""
+        assert image.shape[1] == 1, f"Expected 1 channel image, got {image.shape}"
+
+        # Shared Encoder
+        x = self.relu(self.conv1a(image))
+        x = self.relu(self.conv1b(x))
+        x = self.pool(x)
+        x = self.relu(self.conv2a(x))
+        x = self.relu(self.conv2b(x))
+        x = self.pool(x)
+        x = self.relu(self.conv3a(x))
+        x = self.relu(self.conv3b(x))
+        x = self.pool(x)
+        x = self.relu(self.conv4a(x))
+        x = self.relu(self.conv4b(x))
+
+        # Compute the dense keypoint scores
+        cPa = self.relu(self.convPa(x))
+        scores = self.convPb(cPa)
+        scores = torch.nn.functional.softmax(scores, 1)[:, :-1]
+        b, _, h, w = scores.shape
+        scores = scores.permute(0, 2, 3, 1).reshape(b, h, w, 8, 8)
+        scores = scores.permute(0, 1, 3, 2, 4).reshape(b, h * 8, w * 8)
+
+        # Compute the dense descriptors
+        cDa = self.relu(self.convDa(x))
+        descriptors = self.convDb(cDa)
+        descriptors = torch.nn.functional.normalize(descriptors, p=2, dim=1)
+
+        return {
+            "scores": scores,
+            "descriptors": descriptors,
+        }
+

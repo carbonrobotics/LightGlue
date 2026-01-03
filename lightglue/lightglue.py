@@ -65,20 +65,83 @@ def apply_cached_rotary_emb(freqs: torch.Tensor, t: torch.Tensor) -> torch.Tenso
     return (t * freqs[0]) + (rotate_half(t) * freqs[1])
 
 
+# TensorRT-compatible versions of the above functions
+def rotate_half_trt(x: torch.Tensor) -> torch.Tensor:
+    """TensorRT-compatible version matching original rotate_half behavior.
+
+    Original rotate_half treats the last dimension as pairs: [a0, b0, a1, b1, ...]
+    and rotates each pair to [-b0, a0, -b1, a1, ...].
+
+    This TRT version uses reshape instead of unflatten/unbind/stack.
+    """
+    # Reshape to pairs: [..., D] -> [..., D//2, 2]
+    shape = list(x.shape)
+    new_shape = shape[:-1] + [shape[-1] // 2, 2]
+    x = x.reshape(*new_shape)
+    # Extract pairs: x[..., 0] = a values, x[..., 1] = b values
+    x1 = x[..., 0]  # [..., D//2]
+    x2 = x[..., 1]  # [..., D//2]
+    # Stack rotated pairs: [-b, a] for each pair, then flatten
+    # Result shape: [..., D//2, 2] -> [..., D]
+    rotated = torch.stack((-x2, x1), dim=-1)
+    return rotated.reshape(*shape)
+
+
+def apply_cached_rotary_emb_trt(cos: torch.Tensor, sin: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """TensorRT-compatible version that takes cos and sin separately."""
+    return (t * cos) + (rotate_half_trt(t) * sin)
+
+
+def repeat_interleave_trt(x: torch.Tensor, repeats: int, dim: int) -> torch.Tensor:
+    """TensorRT-compatible version of repeat_interleave.
+
+    For example, if x has shape [2, N, D] and repeats=2, dim=-1:
+    - Unsqueeze to [2, N, D, 1]
+    - Expand to [2, N, D, 2]
+    - Reshape to [2, N, D*2]
+    """
+    # Normalize negative dimension
+    ndim = x.dim()
+    if dim < 0:
+        dim = ndim + dim
+
+    # Add a dimension after dim for repeating: [2, N, D] -> [2, N, D, 1]
+    x = x.unsqueeze(dim + 1)
+
+    # Get the expanded shape and expand
+    expand_shape = list(x.shape)
+    expand_shape[dim + 1] = repeats
+    x = x.expand(*expand_shape)
+
+    # Flatten the repeated dimension with the original dimension
+    # [2, N, D, repeats] -> [2, N, D*repeats]
+    shape = list(x.shape)
+    new_shape = shape[:dim] + [shape[dim] * repeats] + shape[dim + 2:]
+    return x.reshape(*new_shape)
+
+
 class LearnableFourierPositionalEncoding(nn.Module):
-    def __init__(self, M: int, dim: int, F_dim: int = None, gamma: float = 1.0) -> None:
+    def __init__(self, M: int, dim: int, F_dim: int = None, gamma: float = 1.0,
+                 repeat_fn: callable = None, return_separated_encoding: bool = False) -> None:
         super().__init__()
         F_dim = F_dim if F_dim is not None else dim
         self.gamma = gamma
         self.Wr = nn.Linear(M, F_dim // 2, bias=False)
         nn.init.normal_(self.Wr.weight.data, mean=0, std=self.gamma**-2)
+        self.repeat_fn = repeat_fn if repeat_fn is not None else torch.Tensor.repeat_interleave
+        self.return_separated_encoding = return_separated_encoding
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """encode position vector"""
         projected = self.Wr(x)
         cosines, sines = torch.cos(projected), torch.sin(projected)
+        if self.return_separated_encoding:
+            # Return cos and sin separately for TensorRT-compatible rotary embedding
+            cos_emb = self.repeat_fn(cosines.unsqueeze(-3), 2, dim=-1)
+            sin_emb = self.repeat_fn(sines.unsqueeze(-3), 2, dim=-1)
+            return cos_emb, sin_emb
         emb = torch.stack([cosines, sines], 0).unsqueeze(-3)
-        return emb.repeat_interleave(2, dim=-1)
+        return self.repeat_fn(emb, 2, dim=-1)
 
 
 class TokenConfidence(nn.Module):
@@ -260,6 +323,250 @@ class TransformerLayer(nn.Module):
         desc0 = self.self_attn(desc0, encoding0, mask0)
         desc1 = self.self_attn(desc1, encoding1, mask1)
         return self.cross_attn(desc0, desc1, mask)
+
+
+# ==================== TensorRT-Compatible Classes ====================
+
+def unflatten_trt(x: torch.Tensor, dim: int, sizes: Tuple[int, ...]) -> torch.Tensor:
+    """TensorRT-compatible unflatten using reshape.
+
+    Args:
+        x: Input tensor
+        dim: Dimension to unflatten
+        sizes: Tuple of sizes for the new dimensions. -1 means infer.
+
+    Note: This function uses x.shape which will be traced with concrete values
+    during torch2trt conversion. For truly dynamic shapes, consider using ONNX
+    export with dynamic axes.
+    """
+    shape = list(x.shape)
+    ndim = len(shape)
+
+    # Normalize negative dimension
+    if dim < 0:
+        dim = ndim + dim
+
+    # Compute -1 in sizes if present
+    sizes = list(sizes)
+    if -1 in sizes:
+        idx = sizes.index(-1)
+        known_product = 1
+        for s in sizes:
+            if s != -1:
+                known_product *= s
+        sizes[idx] = shape[dim] // known_product
+
+    # Build new shape
+    new_shape = shape[:dim] + sizes + shape[dim + 1:]
+    return x.reshape(*new_shape)
+
+
+class AttentionTRT(nn.Module):
+    """TensorRT-compatible attention using matmul instead of einsum."""
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, q, k, v, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # q, k, v: [B, H, N, D]
+        s = q.shape[-1] ** -0.5
+        # Use matmul: [B, H, N, D] @ [B, H, D, M] -> [B, H, N, M]
+        sim = torch.matmul(q, k.transpose(-2, -1)) * s
+        if mask is not None:
+            sim = sim.masked_fill(~mask, -float("inf"))
+        attn = F.softmax(sim, -1)
+        # [B, H, N, M] @ [B, H, M, D] -> [B, H, N, D]
+        return torch.matmul(attn, v)
+
+
+class SelfBlockTRT(nn.Module):
+    """TensorRT-compatible SelfBlock."""
+    def __init__(
+        self, embed_dim: int, num_heads: int, flash: bool = False, bias: bool = True
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        assert self.embed_dim % num_heads == 0
+        self.head_dim = self.embed_dim // num_heads
+        self.Wqkv = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
+        self.inner_attn = AttentionTRT()
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.ffn = nn.Sequential(
+            nn.Linear(2 * embed_dim, 2 * embed_dim),
+            nn.LayerNorm(2 * embed_dim, elementwise_affine=True),
+            nn.GELU(),
+            nn.Linear(2 * embed_dim, embed_dim),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        encoding_cos: torch.Tensor,
+        encoding_sin: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        qkv = self.Wqkv(x)
+        # Match original memory layout: unflatten to [B, N, H, head_dim, 3], transpose, extract
+        # Original: qkv.unflatten(-1, (num_heads, -1, 3)).transpose(1, 2) -> [B, H, N, head_dim, 3]
+        # The weights are interleaved as [q0, k0, v0, q1, k1, v1, ...] for each head position
+        qkv = unflatten_trt(qkv, -1, (self.num_heads, self.head_dim, 3))  # [B, N, H, head_dim, 3]
+        qkv = qkv.transpose(1, 2)  # [B, H, N, head_dim, 3]
+        q, k, v = qkv[..., 0], qkv[..., 1], qkv[..., 2]  # Each [B, H, N, head_dim]
+        q = apply_cached_rotary_emb_trt(encoding_cos, encoding_sin, q)
+        k = apply_cached_rotary_emb_trt(encoding_cos, encoding_sin, k)
+        context = self.inner_attn(q, k, v, mask=mask)
+        message = self.out_proj(context.transpose(1, 2).flatten(start_dim=-2))
+        return x + self.ffn(torch.cat([x, message], -1))
+
+
+class CrossBlockTRT(nn.Module):
+    """TensorRT-compatible CrossBlock using matmul instead of einsum."""
+    def __init__(
+        self, embed_dim: int, num_heads: int, flash: bool = False, bias: bool = True
+    ) -> None:
+        super().__init__()
+        self.heads = num_heads
+        dim_head = embed_dim // num_heads
+        self.scale = dim_head**-0.5
+        inner_dim = dim_head * num_heads
+        self.to_qk = nn.Linear(embed_dim, inner_dim, bias=bias)
+        self.to_v = nn.Linear(embed_dim, inner_dim, bias=bias)
+        self.to_out = nn.Linear(inner_dim, embed_dim, bias=bias)
+        self.ffn = nn.Sequential(
+            nn.Linear(2 * embed_dim, 2 * embed_dim),
+            nn.LayerNorm(2 * embed_dim, elementwise_affine=True),
+            nn.GELU(),
+            nn.Linear(2 * embed_dim, embed_dim),
+        )
+
+    def _unflatten_trt(self, t: torch.Tensor) -> torch.Tensor:
+        """Reshape [B, N, D] -> [B, H, N, D//H]"""
+        # Use unflatten_trt instead of extracting shape values for TensorRT compatibility
+        return unflatten_trt(t, -1, (self.heads, -1)).transpose(1, 2)
+
+    def forward(
+        self, x0: torch.Tensor, x1: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> List[torch.Tensor]:
+        qk0, qk1 = self.to_qk(x0), self.to_qk(x1)
+        v0, v1 = self.to_v(x0), self.to_v(x1)
+        qk0, qk1, v0, v1 = [self._unflatten_trt(t) for t in (qk0, qk1, v0, v1)]
+
+        qk0, qk1 = qk0 * self.scale**0.5, qk1 * self.scale**0.5
+        # qk0: [B, H, M, D], qk1: [B, H, N, D]
+        # sim = qk0 @ qk1.T: [B, H, M, D] @ [B, H, D, N] -> [B, H, M, N]
+        sim = torch.matmul(qk0, qk1.transpose(-2, -1))
+        if mask is not None:
+            sim = sim.masked_fill(~mask, -float("inf"))
+        attn01 = F.softmax(sim, dim=-1)  # [B, H, M, N]
+        attn10 = F.softmax(sim.transpose(-2, -1).contiguous(), dim=-1)  # [B, H, N, M]
+        # m0: attn01 @ v1 = [B, H, M, N] @ [B, H, N, D] -> [B, H, M, D]
+        m0 = torch.matmul(attn01, v1)
+        # m1: attn10 @ v0 = [B, H, N, M] @ [B, H, M, D] -> [B, H, N, D]
+        m1 = torch.matmul(attn10, v0)
+        if mask is not None:
+            m0, m1 = m0.nan_to_num(), m1.nan_to_num()
+
+        # Flatten back: [B, H, N, D] -> [B, N, H*D]
+        m0 = m0.transpose(1, 2).flatten(start_dim=-2)
+        m1 = m1.transpose(1, 2).flatten(start_dim=-2)
+        m0, m1 = self.to_out(m0), self.to_out(m1)
+        x0 = x0 + self.ffn(torch.cat([x0, m0], -1))
+        x1 = x1 + self.ffn(torch.cat([x1, m1], -1))
+        return x0, x1
+
+
+class TransformerLayerTRT(nn.Module):
+    """TensorRT-compatible TransformerLayer."""
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.self_attn = SelfBlockTRT(*args, **kwargs)
+        self.cross_attn = CrossBlockTRT(*args, **kwargs)
+
+    def forward(
+        self,
+        desc0,
+        desc1,
+        encoding0_cos,
+        encoding0_sin,
+        encoding1_cos,
+        encoding1_sin,
+        mask0: Optional[torch.Tensor] = None,
+        mask1: Optional[torch.Tensor] = None,
+    ):
+        # No masked forward for TRT - just use the simple path
+        desc0 = self.self_attn(desc0, encoding0_cos, encoding0_sin)
+        desc1 = self.self_attn(desc1, encoding1_cos, encoding1_sin)
+        return self.cross_attn(desc0, desc1)
+
+
+def logsigmoid_trt(x: torch.Tensor) -> torch.Tensor:
+    """TensorRT-compatible logsigmoid using softplus."""
+    # logsigmoid(x) = -softplus(-x)
+    return -F.softplus(-x)
+
+
+def log_softmax_trt(x: torch.Tensor, dim: int) -> torch.Tensor:
+    """TensorRT-compatible log_softmax.
+
+    F.log_softmax doesn't work correctly with torch2trt, so we implement it
+    using operations that are supported: max, exp, sum, log.
+    """
+    x_max = x.max(dim=dim, keepdim=True).values
+    x_shifted = x - x_max
+    log_sum_exp = torch.log(torch.exp(x_shifted).sum(dim=dim, keepdim=True))
+    return x_shifted - log_sum_exp
+
+
+def sigmoid_log_double_softmax_trt(
+    sim: torch.Tensor, z0: torch.Tensor, z1: torch.Tensor
+) -> torch.Tensor:
+    """TensorRT-compatible version - create the log assignment matrix from logits and similarity."""
+    certainties = logsigmoid_trt(z0) + logsigmoid_trt(z1).transpose(1, 2)
+    scores0 = log_softmax_trt(sim, 2)
+    scores1 = log_softmax_trt(sim.transpose(-1, -2).contiguous(), 2).transpose(-1, -2)
+
+    # Build scores matrix without new_full
+    # Main scores block
+    main_scores = scores0 + scores1 + certainties  # [B, M, N]
+
+    # Unmatched scores for dim 0: logsigmoid(-z0) -> [B, M, 1]
+    unmatch0 = logsigmoid_trt(-z0)  # [B, M, 1]
+    # Unmatched scores for dim 1: logsigmoid(-z1) -> [B, N, 1] -> [B, 1, N]
+    unmatch1 = logsigmoid_trt(-z1).transpose(1, 2)  # [B, 1, N]
+
+    # Build the full [B, M+1, N+1] matrix
+    # Row for unmatched in dim1: [unmatch1, 0] -> [B, 1, N+1]
+    corner = main_scores[:, :1, :1] * 0  # [B, 1, 1] of zeros
+    unmatch1_row = torch.cat([unmatch1, corner], dim=2)  # [B, 1, N+1]
+
+    # Main block with unmatch0 column: [main_scores, unmatch0] -> [B, M, N+1]
+    main_with_unmatch = torch.cat([main_scores, unmatch0], dim=2)  # [B, M, N+1]
+
+    # Full matrix: stack main_with_unmatch and unmatch1_row
+    scores = torch.cat([main_with_unmatch, unmatch1_row], dim=1)  # [B, M+1, N+1]
+
+    return scores
+
+
+class MatchAssignmentTRT(nn.Module):
+    """TensorRT-compatible MatchAssignment using matmul instead of einsum."""
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.dim = dim
+        self.matchability = nn.Linear(dim, 1, bias=True)
+        self.final_proj = nn.Linear(dim, dim, bias=True)
+
+    def forward(self, desc0: torch.Tensor, desc1: torch.Tensor):
+        """build assignment matrix from descriptors"""
+        mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
+        # Use self.dim (fixed at construction) instead of extracting from shape
+        mdesc0, mdesc1 = mdesc0 / self.dim**0.25, mdesc1 / self.dim**0.25
+        # Use matmul: [B, M, D] @ [B, D, N] -> [B, M, N]
+        sim = torch.matmul(mdesc0, mdesc1.transpose(-2, -1))
+        z0 = self.matchability(desc0)
+        z1 = self.matchability(desc1)
+        scores = sigmoid_log_double_softmax_trt(sim, z0, z1)
+        return scores, sim
 
 
 def sigmoid_log_double_softmax(
@@ -660,3 +967,167 @@ class LightGlue(nn.Module):
             return self.pruning_keypoint_thresholds["flash"]
         else:
             return self.pruning_keypoint_thresholds[device.type]
+
+
+class LightGlueLite(nn.Module):
+    """TensorRT-compatible version of LightGlue.
+
+    This class uses TensorRT-compatible operations:
+    - matmul instead of einsum
+    - reshape instead of unflatten
+    - explicit cos/sin for rotary embeddings instead of stacked tensor
+    - No dynamic control flow (early stopping, pruning)
+    - Returns raw scores tensor for post-processing outside TensorRT
+
+    Usage:
+        model = LightGlueLite(flash=False, force_einsum=True)
+        scores = model(normalized_kpts0, normalized_kpts1, desc0, desc1)
+        # Post-process scores with filter_matches outside TensorRT
+    """
+
+    default_conf = {
+        "name": "lightglue",
+        "input_dim": 256,
+        "descriptor_dim": 256,
+        "add_scale_ori": False,
+        "n_layers": 9,
+        "num_heads": 4,
+        "flash": False,  # Must be False for TensorRT
+        "mp": False,
+        "depth_confidence": -1,  # Disabled for TensorRT
+        "width_confidence": -1,  # Disabled for TensorRT
+        "filter_threshold": 0.1,
+        "weights": None,
+        "force_einsum": True,  # Must be True for TensorRT
+    }
+
+    version = "v0.1_arxiv"
+    url = "https://github.com/cvg/LightGlue/releases/download/{}/{}_lightglue.pth"
+
+    features = {
+        "superpoint": {
+            "weights": "superpoint_lightglue",
+            "input_dim": 256,
+        },
+        "disk": {
+            "weights": "disk_lightglue",
+            "input_dim": 128,
+        },
+        "aliked": {
+            "weights": "aliked_lightglue",
+            "input_dim": 128,
+        },
+        "sift": {
+            "weights": "sift_lightglue",
+            "input_dim": 128,
+            "add_scale_ori": True,
+        },
+        "doghardnet": {
+            "weights": "doghardnet_lightglue",
+            "input_dim": 128,
+            "add_scale_ori": True,
+        },
+    }
+
+    def __init__(self, features="superpoint", **conf) -> None:
+        super().__init__()
+        self.conf = conf = SimpleNamespace(**{**self.default_conf, **conf})
+
+        # Override settings for TensorRT compatibility
+        conf.flash = False
+        conf.depth_confidence = -1
+        conf.width_confidence = -1
+
+        if features is not None:
+            if features not in self.features:
+                raise ValueError(
+                    f"Unsupported features: {features} not in "
+                    f"{{{','.join(self.features)}}}"
+                )
+            for k, v in self.features[features].items():
+                setattr(conf, k, v)
+
+        if conf.input_dim != conf.descriptor_dim:
+            self.input_proj = nn.Linear(conf.input_dim, conf.descriptor_dim, bias=True)
+        else:
+            self.input_proj = nn.Identity()
+
+        head_dim = conf.descriptor_dim // conf.num_heads
+        # Use TRT-compatible positional encoding
+        self.posenc = LearnableFourierPositionalEncoding(
+            2 + 2 * self.conf.add_scale_ori,
+            head_dim,
+            head_dim,
+            repeat_fn=repeat_interleave_trt,
+            return_separated_encoding=True
+        )
+
+        h, n, d = conf.num_heads, conf.n_layers, conf.descriptor_dim
+
+        # Use TRT-compatible transformer layers
+        self.transformers = nn.ModuleList(
+            [TransformerLayerTRT(d, h, conf.flash) for _ in range(n)]
+        )
+
+        # Use TRT-compatible match assignment (only need the last one for inference)
+        self.log_assignment = nn.ModuleList([MatchAssignmentTRT(d) for _ in range(n)])
+
+        # Load pretrained weights
+        state_dict = None
+        if features is not None:
+            fname = f"{conf.weights}_{self.version.replace('.', '-')}.pth"
+            state_dict = torch.hub.load_state_dict_from_url(
+                self.url.format(self.version, features), file_name=fname
+            )
+        elif conf.weights is not None:
+            path = Path(__file__).parent
+            path = path / "weights/{}.pth".format(self.conf.weights)
+            state_dict = torch.load(str(path), map_location="cpu")
+
+        if state_dict:
+            # Rename old state dict entries
+            for i in range(self.conf.n_layers):
+                pattern = f"self_attn.{i}", f"transformers.{i}.self_attn"
+                state_dict = {k.replace(*pattern): v for k, v in state_dict.items()}
+                pattern = f"cross_attn.{i}", f"transformers.{i}.cross_attn"
+                state_dict = {k.replace(*pattern): v for k, v in state_dict.items()}
+            self.load_state_dict(state_dict, strict=False)
+
+    def forward(
+        self,
+        normalized_keypoints_0: torch.Tensor,
+        normalized_keypoints_1: torch.Tensor,
+        descriptors_0: torch.Tensor,
+        descriptors_1: torch.Tensor
+    ) -> torch.Tensor:
+        """Forward pass for LightGlueLite.
+
+        Args:
+            normalized_keypoints_0: Normalized keypoints for image 0, shape [B, M, 2]
+            normalized_keypoints_1: Normalized keypoints for image 1, shape [B, N, 2]
+            descriptors_0: Descriptors for image 0, shape [B, M, D]
+            descriptors_1: Descriptors for image 1, shape [B, N, D]
+
+        Returns:
+            scores: Log assignment matrix, shape [B, M+1, N+1]
+                   Use filter_matches(scores, threshold) for post-processing
+        """
+        desc_0 = self.input_proj(descriptors_0)
+        desc_1 = self.input_proj(descriptors_1)
+
+        # Get positional encodings (cos and sin separately for TRT)
+        encoding_0_cos, encoding_0_sin = self.posenc(normalized_keypoints_0)
+        encoding_1_cos, encoding_1_sin = self.posenc(normalized_keypoints_1)
+
+        # Run all transformer layers (no early stopping for TensorRT)
+        for i in range(self.conf.n_layers):
+            desc_0, desc_1 = self.transformers[i](
+                desc_0, desc_1,
+                encoding_0_cos, encoding_0_sin,
+                encoding_1_cos, encoding_1_sin
+            )
+
+        # Get final scores using the last layer's assignment module
+        scores, _ = self.log_assignment[self.conf.n_layers - 1](desc_0, desc_1)
+
+        return scores

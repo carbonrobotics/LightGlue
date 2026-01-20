@@ -231,6 +231,8 @@ class SuperPoint(Extractor):
 
 def preprocess(image: torch.Tensor, resize_long_dimension: int) -> Tuple[torch.Tensor, torch.Tensor]:
     image, scale = ImagePreprocessor(resize=resize_long_dimension)(image)
+    if image.shape[1] == 3:
+        image = rgb_to_grayscale(image)
     return image, scale
 
 
@@ -352,8 +354,5 @@ class SuperPointLite(torch.nn.Module):
         descriptors = self.convDb(cDa)
         descriptors = torch.nn.functional.normalize(descriptors, p=2, dim=1)
 
-        return {
-            "scores": scores,
-            "descriptors": descriptors,
-        }
+        return scores, descriptors
 

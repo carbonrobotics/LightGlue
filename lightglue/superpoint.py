@@ -229,9 +229,9 @@ class SuperPoint(Extractor):
         }
 
 
-def preprocess(image: torch.Tensor, resize_long_dimension: int) -> Tuple[torch.Tensor, torch.Tensor]:
+def preprocess(image: torch.Tensor, resize_long_dimension: int, return_greyscale: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
     image, scale = ImagePreprocessor(resize=resize_long_dimension)(image)
-    if image.shape[1] == 3:
+    if return_greyscale and image.shape[1] == 3:
         image = rgb_to_grayscale(image)
     return image, scale
 
